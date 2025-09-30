@@ -6,7 +6,7 @@ import asyncio
 from typing import List, Optional, AsyncGenerator
 import json
 from datetime import datetime
-import uuid # Добавлен импорт для уникальных ID
+import uuid
 
 app = FastAPI()
 
@@ -20,7 +20,8 @@ class ChatRequest(BaseModel):
     model: str  # character_id, например "YntB_3_f-Yv2h29d3M_e-1aW3P_G1b4zAn2M2y3kG4"
     messages: List[Message]
     stream: Optional[bool] = False
-    chat_id: Optional[str] = None  # Для продолжения существующего чата
+    # chat_id больше не используется клиентом, сервер управляет им сам
+    # chat_id: Optional[str] = None
 
 # --- Зависимости FastAPI ---
 
@@ -41,18 +42,13 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
     try:
         client = await get_client(token=token)
         char_id = request.model
-        chat_id = request.chat_id
-
-        # --- Логика обработки истории ---
-        # Проблема: API OpenAI без состояний (передает всю историю), а Character.AI - с состояниями (использует chat_id).
-        # Решение: Лучший способ - это когда клиент (Risu.ai) сохраняет chat_id из ответа и присылает его обратно.
-        # Этот код будет работать наиболее эффективно, если клиент поддерживает такое поведение.
         
-        if not chat_id:
-            # Если chat_id не предоставлен, создаем новый чат.
-            # В этом случае ИИ не будет иметь контекста предыдущих сообщений.
-            chat, _ = await client.chat.create_chat(char_id)
-            chat_id = chat.chat_id
+        # --- НОВАЯ ЛОГИКА УПРАВЛЕНИЯ ПАМЯТЬЮ ---
+        # Вместо создания нового чата каждый раз, мы получаем самый последний
+        # существующий чат с этим персонажем. Это гарантирует сохранение контекста.
+        # Примечание: Это означает, что все запросы к этому персонажу будут идти в одну и ту же беседу.
+        chat = await client.chat2.get_chat(char_id)
+        chat_id = chat['chat_id']
 
         user_msg = request.messages[-1].content
 
@@ -75,8 +71,8 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                                     "index": 0,
                                     "delta": {"content": chunk.text},
                                     "finish_reason": None
-                                }],
-                                "chat_id": chat_id # <-- ИЗМЕНЕНИЕ: Добавляем chat_id, чтобы клиент его получил
+                                }]
+                                # chat_id больше не отправляется клиенту
                             }
                             yield f"data: {json.dumps(response_chunk)}\n\n"
                     
@@ -86,8 +82,7 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                         "object": "chat.completion.chunk",
                         "created": created_ts,
                         "model": request.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        "chat_id": chat_id # <-- ИЗМЕНЕНИЕ: Добавляем chat_id также и в финальный чанк
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
@@ -102,7 +97,6 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
             answer = await client.chat.send_message(char_id, chat_id, user_msg)
             response_text = answer.get_primary_candidate().text if answer.get_primary_candidate() else ""
 
-            # Возвращаем chat_id в ответе. Клиент должен его сохранить и использовать для следующего запроса.
             return {
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
@@ -113,8 +107,8 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                     "message": {"role": "assistant", "content": response_text},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "chat_id": chat_id  # Пользовательское поле для сохранения состояния
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                # chat_id больше не отправляется клиенту
             }
 
     except Exception as e:
