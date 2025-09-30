@@ -17,7 +17,6 @@ class ChatRequest(BaseModel):
     model: str  # character_id, e.g. "abc123"
     messages: List[Message]
     stream: Optional[bool] = False
-    chat_id: Optional[str] = None  # Для persistent чата, если есть
 
 async def get_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -34,21 +33,22 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
         char_id = request.model
         user_msg = request.messages[-1].content
 
-        # Создаём чат если нет chat_id
-        if not request.chat_id:
-            chat, _ = await client.chat.create_chat(char_id)
-            chat_id = chat.chat_id
-        else:
-            chat_id = request.chat_id
+        # Всегда новый чат для простоты (как в первом коде)
+        chat, _ = await client.chat.create_chat(char_id)
+        chat_id = chat.chat_id
 
         if request.stream:
             async def stream_gen() -> AsyncGenerator[str, None]:
                 answer = await client.chat.send_message(char_id, chat_id, user_msg, streaming=True)
-                printed_length = 0  # Для симуляции, но в API просто yield chunks
+                printed_length = 0
                 async for message_part in answer:
                     text = message_part.get_primary_candidate().text
-                    delta = {"content": text[printed_length:]}
+                    delta_content = text[printed_length:]
                     printed_length = len(text)
+                    if delta_content:
+                        delta = {"content": delta_content}
+                    else:
+                        delta = {"content": ""}
                     chunk_data = json.dumps({
                         "id": f"chatcmpl-{datetime.now().timestamp()}",
                         "object": "chat.completion.chunk",
@@ -57,14 +57,13 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                     })
                     yield f"data: {chunk_data}\n\n"
-                # Финальный chunk с finish и chat_id
-                final_delta = {"content": "", "chat_id": chat_id}
+                # Финальный chunk без chat_id
                 final_data = json.dumps({
                     "id": f"chatcmpl-{datetime.now().timestamp()}",
                     "object": "chat.completion.chunk",
                     "created": int(datetime.now().timestamp()),
                     "model": request.model,
-                    "choices": [{"index": 0, "delta": final_delta, "finish_reason": "stop"}]
+                    "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]
                 })
                 yield f"data: {final_data}\n\n"
                 yield "data: [DONE]\n\n"
@@ -85,8 +84,7 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                     "message": {"role": "assistant", "content": response_text},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "chat_id": chat_id  # Добавлено для persistence
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             }
 
     except Exception as e:
