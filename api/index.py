@@ -43,8 +43,12 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
 
         if request.stream:
             async def stream_gen() -> AsyncGenerator[str, None]:
-                async for chunk in client.chat.send_message_stream(char_id, chat_id, user_msg):
-                    delta = {"content": chunk.text}
+                answer = await client.chat.send_message(char_id, chat_id, user_msg, streaming=True)
+                printed_length = 0  # Для симуляции, но в API просто yield chunks
+                async for message_part in answer:
+                    text = message_part.get_primary_candidate().text
+                    delta = {"content": text[printed_length:]}
+                    printed_length = len(text)
                     chunk_data = json.dumps({
                         "id": f"chatcmpl-{datetime.now().timestamp()}",
                         "object": "chat.completion.chunk",
@@ -53,6 +57,16 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                     })
                     yield f"data: {chunk_data}\n\n"
+                # Финальный chunk с finish и chat_id
+                final_delta = {"content": "", "chat_id": chat_id}
+                final_data = json.dumps({
+                    "id": f"chatcmpl-{datetime.now().timestamp()}",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": final_delta, "finish_reason": "stop"}]
+                })
+                yield f"data: {final_data}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(stream_gen(), media_type="text/plain")
@@ -71,7 +85,8 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                     "message": {"role": "assistant", "content": response_text},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "chat_id": chat_id  # Добавлено для persistence
             }
 
     except Exception as e:
@@ -82,7 +97,7 @@ async def list_models(token: str = Depends(get_token)):
     # Заглушка: вернёт твой character_id как модель
     return {
         "object": "list",
-        "data": [{"id": request.model if 'request' in locals() else "default-char", "object": "model"}]
+        "data": [{"id": "default-char", "object": "model"}]
     }
 
 @app.get("/")
