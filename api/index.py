@@ -10,6 +10,11 @@ import uuid
 
 app = FastAPI()
 
+# --- Глобальное хранилище для ID чатов ---
+# Это простое решение для хранения сессий в памяти сервера.
+# При перезапуске сервера "память" персонажей будет сброшена.
+chat_sessions = {}
+
 # --- Модели данных Pydantic ---
 
 class Message(BaseModel):
@@ -43,12 +48,20 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
         client = await get_client(token=token)
         char_id = request.model
         
-        # --- НОВАЯ ЛОГИКА УПРАВЛЕНИЯ ПАМЯТЬЮ ---
-        # Вместо создания нового чата каждый раз, мы получаем самый последний
-        # существующий чат с этим персонажем. Это гарантирует сохранение контекста.
-        # Примечание: Это означает, что все запросы к этому персонажу будут идти в одну и ту же беседу.
-        chat = await client.chat2.get_chat(char_id)
-        chat_id = chat['chat_id']
+        # --- ИСПРАВЛЕННАЯ ЛОГИКА УПРАВЛЕНИЯ ПАМЯТЬЮ ---
+        # Мы используем словарь в памяти сервера для отслеживания chat_id для каждого персонажа.
+        # Это исправляет ошибку 'chat2' и решает проблему с памятью.
+        
+        chat_id = chat_sessions.get(char_id)
+
+        if not chat_id:
+            # Если для этого персонажа еще нет сессии, создаем новую.
+            # Используем старый, надежный метод v1 API.
+            print(f"Активная сессия для {char_id} не найдена. Создание нового чата.")
+            chat, _ = await client.chat.create_chat(char_id)
+            chat_id = chat.chat_id
+            chat_sessions[char_id] = chat_id # Сохраняем ID для будущих запросов
+            print(f"Новая сессия создана: {char_id} -> {chat_id}")
 
         user_msg = request.messages[-1].content
 
@@ -59,7 +72,7 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
 
             async def stream_generator() -> AsyncGenerator[str, None]:
                 try:
-                    # Используем потоковый метод клиента
+                    # Используем потоковый метод клиента из v1 API
                     async for chunk in client.chat.send_message_stream(char_id, chat_id, user_msg):
                         if chunk.text:
                             response_chunk = {
@@ -72,11 +85,9 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                                     "delta": {"content": chunk.text},
                                     "finish_reason": None
                                 }]
-                                # chat_id больше не отправляется клиенту
                             }
                             yield f"data: {json.dumps(response_chunk)}\n\n"
                     
-                    # Отправляем финальный блок с причиной завершения
                     final_chunk = {
                         "id": stream_id,
                         "object": "chat.completion.chunk",
@@ -89,11 +100,11 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                 except Exception as e:
                     print(f"Ошибка во время потоковой передачи: {e}")
 
-            # Важно: media_type должен быть 'text/event-stream' для SSE
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         # --- Логика обычного (непотокового) ответа ---
         else:
+            # Используем обычный метод клиента из v1 API
             answer = await client.chat.send_message(char_id, chat_id, user_msg)
             response_text = answer.get_primary_candidate().text if answer.get_primary_candidate() else ""
 
@@ -108,7 +119,6 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
                     "finish_reason": "stop"
                 }],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                # chat_id больше не отправляется клиенту
             }
 
     except Exception as e:
@@ -119,8 +129,6 @@ async def chat_completions(request: ChatRequest, token: str = Depends(get_token)
 @app.get("/v1/models")
 async def list_models():
     """Возвращает список доступных моделей (персонажей)."""
-    # Это заглушка. Вам нужно заменить "YOUR_CHARACTER_ID" на реальный ID вашего персонажа.
-    # Клиент выберет эту "модель" для начала чата.
     return {
         "object": "list",
         "data": [
