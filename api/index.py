@@ -7,7 +7,7 @@ import aiosqlite
 import asyncio
 from datetime import datetime
 from typing import List, Optional, AsyncGenerator
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -111,10 +111,10 @@ async def fetch_unsynced_external_messages(character_id: str, chat_id: str, excl
         rows = await cur.fetchall()
     return rows
 
-# Retry-секция
+# Retry-секция (для non-streaming)
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, max=10))
 async def send_message_with_retry(client, char_id: str, chat_id: str, content: str):
-    return await client.chat.send_message(char_id, chat_id, content, stream=False)
+    return await client.chat.send_message(char_id, chat_id, content, streaming=False)
 
 # Idempotency header dep
 async def get_idempotency_key(idempotency_key: Optional[str] = Header(None), external_ref: Optional[str] = Header(None)):
@@ -239,7 +239,7 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
     async with lock:
         try:
             # реплейим unsynced (limit небольшой для скорости)
-            unsynced = await fetch_unsynced_external_messages(char_id, chat_id, exclude_id=incoming_msg_id, limit=100)
+            unsynced = await fetch_unsynced_external_messages(char_id, chat_id, exclude_id=incoming_msg_id, limit=50)
             for mid, role, content in unsynced:
                 if role != "user":
                     await mark_message_synced(mid)
@@ -262,7 +262,7 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
             if not request.stream:
                 # send current message and return final text
                 try:
-                    ans = await send_message_with_retry(client, char_id, chat_id, user_msg)
+                    ans = await client.chat.send_message(char_id, chat_id, user_msg, streaming=False)
                     response_text = ""
                     try:
                         response_text = ans.get_primary_candidate().text if ans.get_primary_candidate() else ""
@@ -291,8 +291,9 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
                 async def stream_gen() -> AsyncGenerator[str, None]:
                     nonlocal buffer
                     try:
-                        async for chunk in client.chat.send_message(char_id, chat_id, user_msg, stream=True):
-                            if getattr(chunk, "text", None):
+                        ans = await client.chat.send_message(char_id, chat_id, user_msg, streaming=True)
+                        async for chunk in ans:
+                            if hasattr(chunk, "text") and chunk.text:
                                 buffer += chunk.text
                                 response_chunk = {
                                     "id": stream_id,
