@@ -1,4 +1,3 @@
-# api/index.py
 import os
 import sys
 import traceback
@@ -18,7 +17,7 @@ from PyCharacterAI import get_client
 
 APP = FastAPI()
 
-# Path для SQLite — /tmp безопасен в серверлес
+# Path для SQLite — /tmp безопасен в serverless
 TMP_DIR = os.environ.get("TMPDIR") or os.environ.get("TMP") or "/tmp"
 DB_PATH = os.environ.get("CHAT_DB", os.path.join(TMP_DIR, "chat_sync.db"))
 ERROR_LOG_DIR = os.path.join(TMP_DIR, "app_logs")
@@ -115,7 +114,7 @@ async def fetch_unsynced_external_messages(character_id: str, chat_id: str, excl
 # Retry-секция
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, max=10))
 async def send_message_with_retry(client, char_id: str, chat_id: str, content: str):
-    return await client.chat.send_message(char_id, chat_id, content)
+    return await client.chat.send_message(char_id, chat_id, content, stream=False)
 
 # Idempotency header dep
 async def get_idempotency_key(idempotency_key: Optional[str] = Header(None), external_ref: Optional[str] = Header(None)):
@@ -216,8 +215,14 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
                     """, (char_id, chat_id))
                     row = await cur.fetchone()
                     last = row[0] if row else ""
-                return {"id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion", "created": int(datetime.now().timestamp()),
-                        "model": request.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": last}, "finish_reason": "stop"}]}
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "object": "chat.completion",
+                    "created": int(datetime.now().timestamp()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": last}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }
         except Exception as e:
             # логируем, но не прерываем
             write_error_log("idemp_check", e)
@@ -233,7 +238,7 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
     lock = get_lock_for(char_id)
     async with lock:
         try:
-            # реплейим unsynced (limit небольшй для скорости)
+            # реплейим unsynced (limit небольшой для скорости)
             unsynced = await fetch_unsynced_external_messages(char_id, chat_id, exclude_id=incoming_msg_id, limit=100)
             for mid, role, content in unsynced:
                 if role != "user":
@@ -266,9 +271,14 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
                     if response_text:
                         await save_message_db(char_id, chat_id, "assistant", response_text, "characterai", synced=1)
                     await mark_message_synced(incoming_msg_id)
-                    return {"id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion", "created": int(datetime.now().timestamp()),
-                            "model": request.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
-                            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+                    return {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion",
+                        "created": int(datetime.now().timestamp()),
+                        "model": request.model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    }
                 except Exception as e:
                     logp = write_error_log("send_current", e)
                     return JSONResponse(status_code=500, content={"error": "send current failed", "log": logp})
@@ -281,23 +291,33 @@ async def chat_completions(request: ChatRequest, authorization: Optional[str] = 
                 async def stream_gen() -> AsyncGenerator[str, None]:
                     nonlocal buffer
                     try:
-                        async for chunk in client.chat.send_message_stream(char_id, chat_id, user_msg):
+                        async for chunk in client.chat.send_message(char_id, chat_id, user_msg, stream=True):
                             if getattr(chunk, "text", None):
                                 buffer += chunk.text
-                                response_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": created_ts,
-                                                  "model": request.model, "choices":[{"index":0, "delta":{"content": chunk.text}, "finish_reason": None}]}
+                                response_chunk = {
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": request.model,
+                                    "choices": [{"index": 0, "delta": {"content": chunk.text}, "finish_reason": None}]
+                                }
                                 yield f"data: {json.dumps(response_chunk)}\n\n"
                         # finalize
                         if buffer:
                             await save_message_db(char_id, chat_id, "assistant", buffer, "characterai", synced=1)
                         await mark_message_synced(incoming_msg_id)
-                        final = {"id": stream_id, "object":"chat.completion.chunk", "created": created_ts, "model": request.model,
-                                 "choices":[{"index":0, "delta":{}, "finish_reason":"stop"}]}
+                        final = {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        }
                         yield f"data: {json.dumps(final)}\n\n"
                         yield "data: [DONE]\n\n"
                     except Exception as e:
                         logp = write_error_log("stream_error", e)
-                        yield f"data: {json.dumps({'error':'stream failed', 'log': logp})}\n\n"
+                        yield f"data: {json.dumps({'error': 'stream failed', 'log': logp})}\n\n"
                 return StreamingResponse(stream_gen(), media_type="text/event-stream")
         except Exception as e:
             logp = write_error_log("main_handler", e)
