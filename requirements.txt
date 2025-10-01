@@ -1,7 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.32.0
-pydantic==1.10.11
+fastapi==0.118.0
+uvicorn==0.37.0
+pydantic==2.11.9
 PyCharacterAI==2.2.50
-aiosqlite==0.18.0
-python-dotenv==1.0.0
-tenacity==8.2.2
+aiosqlite==0.21.0
+tenacity==9.1.2
+python-dotenv==1.1.1
